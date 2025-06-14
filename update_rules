@@ -1,0 +1,180 @@
+# Modular update_rules.py
+from config import eta_q, log_eps, K
+from agent_schema import Agent
+import numpy as np
+from update_terms_modular import (
+    compute_self_model_gradient,
+    compute_alignment_gradient,
+    compute_phi_alignment_gradient
+)
+from math_utils import sanitize_q
+from update_terms_modular import compute_model_alignment_gradient  # add to your import block
+
+from update_terms_modular import compute_phi_model_update
+import config
+
+def update_beliefs(i: int, agents: list[Agent], params: dict) -> Agent:
+    from config import set_config_from_params
+    set_config_from_params(params)
+
+    agent_i = agents[i]
+    q_i = agent_i.q
+    mask_i = agent_i.mask
+
+    grad = compute_self_model_gradient(agent_i)
+    grad += compute_alignment_gradient(agent_i, agents)
+
+    # Apply gradient update
+    q_new = q_i - eta_q * grad
+
+    # Keep q fixed outside support
+    q_new[mask_i < config.support_cutoff_eps] = q_i[mask_i < config.support_cutoff_eps]
+
+    # Normalize after full update
+    q_new = sanitize_q(q_new, eps=log_eps)
+
+    agent_i.q = q_new
+    return agent_i
+
+
+def update_phi(i: int, agents: list[Agent], eta_phi: float, params: dict) -> Agent:
+    from config import set_config_from_params
+    set_config_from_params(params)
+
+    agent_i = agents[i]
+    phi_i = agent_i.phi
+    mask_i = agent_i.mask
+
+    delta_phi = compute_phi_alignment_gradient(agent_i, agents)
+
+    # φ–φ̃ coupling (pull φ toward φ̃)
+    if hasattr(config, "phi_phi_tilde_coupling") and config.phi_phi_tilde_coupling > 0:
+        if hasattr(agent_i, "phi_model"):
+            phi_model = agent_i.phi_model
+            assert phi_i.shape == phi_model.shape, (
+                f"[ERROR] phi vs phi_model shape mismatch: {phi_i.shape} vs {phi_model.shape}"
+            )
+            delta_phi -= config.phi_phi_tilde_coupling * (phi_i - phi_model) * mask_i[..., None]
+        else:
+            print(f"[WARNING] Agent {i} has no phi_model; skipping phi–phĩ coupling")
+
+    # φ Laplacian smoothing (curvature term)
+    if config.gamma > 0:
+        from scipy.ndimage import laplace
+        lap_phi = np.stack([laplace(phi_i[..., d]) for d in range(3)], axis=-1)
+        delta_phi -= config.gamma * lap_phi * mask_i[..., None]
+
+    # Gauge-weight penalty term
+    if config.gauge_weight > 0:
+        delta_phi -= config.gauge_weight * phi_i * mask_i[..., None]
+
+    # Damping term
+    if hasattr(config, "phi_damping") and config.phi_damping > 0:
+        delta_phi -= config.phi_damping * phi_i * mask_i[..., None]
+
+    # Debug or overflow check
+    if np.any(np.isnan(delta_phi)) or np.any(np.abs(delta_phi) > 1e5):
+        print(f"[WARNING] phi update unstable in agent {i}: max delta_phi = {np.max(np.abs(delta_phi)):.2e}")
+
+    delta_phi = np.nan_to_num(delta_phi, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Final update
+    phi_new = phi_i + eta_phi * delta_phi
+
+    # Optional: clip φ norm to prevent runaway growth
+    phi_max = getattr(config, "phi_max_norm", 10.0)
+    norm = np.linalg.norm(phi_new, axis=-1, keepdims=True)
+    clip_mask = norm > phi_max
+    if np.any(clip_mask):
+        phi_new = np.where(clip_mask, phi_new * (phi_max / (norm + 1e-8)), phi_new)
+
+    agent_i.phi = phi_new
+    agent_i.delta_phi = delta_phi
+
+    return agent_i
+
+
+def update_phi_model(i: int, agents: list[Agent], eta_phi: float, params: dict) -> Agent:
+    from config import set_config_from_params
+    set_config_from_params(params)
+
+    agent_i = agents[i]
+    phi_model = agent_i.phi_model
+    mask_i = agent_i.mask
+
+    delta_phi = compute_phi_model_update(agent_i, agents)
+
+    # φ̃–φ coupling
+    if hasattr(config, "phi_phi_tilde_coupling") and config.phi_phi_tilde_coupling > 0:
+        if hasattr(agent_i, "phi"):
+            phi_i = agent_i.phi
+            assert phi_model.shape == phi_i.shape, (
+                f"[ERROR] phi_model vs phi shape mismatch: {phi_model.shape} vs {phi_i.shape}"
+            )
+            delta_phi -= config.phi_phi_tilde_coupling * (phi_model - phi_i) * mask_i[..., None]
+        else:
+            print(f"[WARNING] Agent {i} has no phi; skipping φ̃–φ coupling")
+
+    # φ̃ damping (decay to 0 unless supported)
+    if hasattr(config, "phi_damping") and config.phi_damping > 0:
+        delta_phi -= config.phi_damping * phi_model * mask_i[..., None]
+
+    # Optional debug: delta φ̃ norm
+    if getattr(config, "debug", False):
+        delta_norm = np.linalg.norm(delta_phi, axis=-1)
+        print(f"[φ̃ DEBUG] Agent {i} — delta_phi_model max: {np.max(delta_norm):.4f}, mean: {np.mean(delta_norm):.4f}")
+
+    # Safety check for instability
+    if np.any(np.isnan(delta_phi)) or np.any(np.abs(delta_phi) > 1e5):
+        print(f"[WARNING] phi-model update unstable in agent {i}: max delta_phi_model = {np.max(np.abs(delta_phi)):.2e}")
+
+    delta_phi = np.nan_to_num(delta_phi, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Apply update
+    phi_model_new = phi_model + eta_phi * delta_phi
+
+    # Optional: clip φ̃ norm
+    phi_max = getattr(config, "phi_max_norm", 10.0)
+    norm = np.linalg.norm(phi_model_new, axis=-1, keepdims=True)
+    clip_mask = norm > phi_max
+    if np.any(clip_mask):
+        phi_model_new = np.where(clip_mask, phi_model_new * (phi_max / (norm + 1e-8)), phi_model_new)
+
+    agent_i.phi_model = phi_model_new
+    agent_i.delta_phi_model = delta_phi
+
+    return agent_i
+
+
+def update_models(i: int, agents: list[Agent], params: dict) -> Agent:
+    from config import set_config_from_params, eta_p, log_eps, support_cutoff_eps
+    from math_utils import sanitize_q
+    set_config_from_params(params)
+
+    agent_i = agents[i]
+    q_i = agent_i.q
+    p_i = agent_i.p
+    mask_i = agent_i.mask
+
+    # Main inter-model alignment gradient
+    grad = compute_model_alignment_gradient(agent_i, agents)
+
+    # 🔁 NEW: Epistemic feedback — pull model toward belief
+    if hasattr(config, "model_feedback_weight") and config.model_feedback_weight > 0:
+        q_safe = np.clip(q_i, log_eps, 1.0)
+        p_safe = np.clip(p_i, log_eps, 1.0)
+        grad_qp = np.log(p_safe / q_safe)  # ∇ₚ D_KL(q || p)
+        grad += config.model_feedback_weight * grad_qp
+
+    # Gradient step
+    p_new = p_i - eta_p * grad
+
+    # Preserve model outside support
+    p_new[mask_i < support_cutoff_eps] = p_i[mask_i < support_cutoff_eps]
+
+    # Normalize only after full update
+    p_new = sanitize_q(p_new, eps=log_eps)
+
+    agent_i.p = p_new
+    return agent_i
+
