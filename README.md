@@ -1,3 +1,3 @@
-more to come soon
-
+more to come soon. next post will be how this unifies physics and cognition and offers a new philosophical perspective on reality eta
+ 6-20-2025
 much work to be done....
